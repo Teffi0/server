@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "814174503865",
+    "project_id": "isktest-71def",
+    "storage_bucket": "isktest-71def.appspot.com"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:814174503865:android:53184633034745b7c46c68",
+        "android_client_info": {
+          "package_name": "com.isk.test"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCfZBY8HIUB7W8gJW_zJ3qt67tLR1aNOgI"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
