@@ -1,4 +1,3 @@
-// Подключение необходимых модулей и библиотек
 const express = require('express');
 const admin = require('firebase-admin');
 const db = require('./config/database');
@@ -19,12 +18,10 @@ app.use(express.urlencoded({ extended: true }));
 app.use(morgan('combined', { stream: { write: message => logger.info(message) } }));
 
 function errorHandler(err, req, res, next) {
-  logger.error(err.stack); // Логируем стек ошибки
+  logger.error(err.stack); 
 
-  // Определяем HTTP статус код ответа
   const statusCode = err.statusCode || 500;
 
-  // Отправляем ответ с сообщением об ошибке
   res.status(statusCode).json({
     error: {
       message: err.message,
@@ -141,12 +138,29 @@ app.get('/task-dates', async (req, res) => {
   }
 });
 
+app.get('/task-participants/:taskId', (req, res) => {
+  const { taskId } = req.params;
+  const query = `
+    SELECT e.full_name
+    FROM employees e
+    INNER JOIN task_employees te ON e.id = te.employee_id
+    WHERE te.task_id = ?
+  `;
+
+  db.query(query, [taskId], (err, results) => {
+    if (err) {
+      console.error('Ошибка при выполнении запроса:', err.message);
+      res.status(500).send('Ошибка сервера при получении участников задачи');
+    } else {
+      res.status(200).json(results.map(row => row.full_name));
+    }
+  });
+});
 
 app.post('/tasks', (req, res) => {
   try {
     const { status, service, payment, cost, start_date, end_date, start_time, end_time, responsible, fullname_client, address_client, phone, description, employees } = req.body;
 
-    // Проверка входных данных
     if (!status || !service || !payment || !cost || !start_date || !end_date || !start_time || !end_time || !responsible || !fullname_client || !address_client || !phone || !description) {
       logger.error('Ошибка: Не все поля задачи заполнены');
       return res.status(400).json({ error: 'Не все поля задачи заполнены' });
@@ -165,7 +179,7 @@ app.post('/tasks', (req, res) => {
       }
 
       const taskId = taskResult.insertId;
-      
+
       if (employees && employees.length) {
         const checkEmployeesExistenceSql = 'SELECT id FROM employees WHERE id IN (?)';
 
@@ -196,30 +210,23 @@ app.post('/tasks', (req, res) => {
         });
         db.query('SELECT task_id, COUNT(employee_id) as employee_count FROM task_employees GROUP BY task_id', (err, results) => {
           if (err) {
-            // Обработка ошибки
             logger.error('Ошибка при подсчете участников для каждого task_id:', err.message);
           } else {
-            // Обработка результатов
             results.forEach((row) => {
               logger.info(`Задача ${row.task_id} имеет ${row.employee_count} участников`);
-              // Здесь можно обновить соответствующую запись в таблице tasks, если это необходимо
             });
           }
         });
         db.query('SELECT task_id, COUNT(employee_id) as employee_count FROM task_employees GROUP BY task_id', (err, results) => {
           if (err) {
             logger.error('Ошибка при подсчете участников:', err.message);
-            // Обработка ошибки, возможно, отправка ответа о неудаче
           } else {
-            // Обновляем количество участников в таблице tasks
             results.forEach((row) => {
               db.query('UPDATE tasks SET employees = ? WHERE id = ?', [row.employee_count, row.task_id], (updateErr) => {
                 if (updateErr) {
                   logger.error('Ошибка при обновлении количества участников:', updateErr.message);
-                  // Обработка ошибки, возможно, отправка ответа о неудаче
                 } else {
                   logger.info(`Количество участников для задачи ${row.task_id} обновлено: ${row.employee_count}`);
-                  // Возможно, отправка подтверждающего ответа
                 }
               });
             });
@@ -241,17 +248,14 @@ app.put('/tasks/:taskId', (req, res) => {
   const { taskId } = req.params;
   const { status } = req.body;
 
-  // SQL-запрос для обновления статуса задачи
   const sql = 'UPDATE tasks SET status = ? WHERE id = ?';
 
-  // Выполняем SQL-запрос с переданными параметрами
   db.query(sql, [status, taskId], (err, result) => {
     if (err) {
       logger.error('Ошибка при обновлении статуса задачи:', err.message);
       return res.status(500).json({ error: 'Ошибка при обновлении статуса задачи' });
     }
 
-    // Если статус задачи успешно обновлен, возвращаем успешный ответ
     res.status(200).json({ message: 'Статус задачи успешно обновлен' });
   });
 });
@@ -289,43 +293,34 @@ app.delete('/clients/:clientId', (req, res) => {
   });
 });
 
-// Эндпоинт для добавления нового клиента
 app.post('/clients', (req, res) => {
-  // Извлекаем данные клиента из тела запроса
   const { full_name, phone_number, address } = req.body;
 
-  // Проверяем, что все необходимые данные были предоставлены
   if (!full_name || !phone_number) {
     return res.status(400).json({ error: 'ФИО и номер телефона являются обязательными полями.' });
   }
 
-  // SQL-запрос для вставки нового клиента в таблицу "clients"
   const sql = 'INSERT INTO clients (full_name, phone_number, address) VALUES (?, ?, ?)';
 
-  // Выполняем SQL-запрос
   db.query(sql, [full_name, phone_number, address], (err, result) => {
     if (err) {
       logger.error('Ошибка при добавлении клиента в базу данных:', err.message);
       return res.status(500).json({ error: 'Ошибка при добавлении клиента' });
     }
 
-    // Если клиент успешно добавлен, возвращаем успешный ответ
     res.status(201).json({ message: 'Клиент успешно добавлен', client_id: result.insertId });
   });
 });
 
-// Эндпоинт для добавления сотрудников к задаче
 app.post('/tasks/:taskId/employees', (req, res) => {
   const { taskId } = req.params;
-  const { employees } = req.body; // Массив ID сотрудников
+  const { employees } = req.body;
 
   if (!employees || !employees.length) {
     return res.status(400).json({ error: 'Необходимо предоставить массив ID сотрудников.' });
   }
-  logger.info(employees);
-  // Подготовим запросы для добавления каждого сотрудника к задаче
-  const insertValues = employees.map(employeeId => [parseInt(taskId, 10), parseInt(employeeId, 10)]);
 
+  const insertValues = employees.map(employeeId => [parseInt(taskId, 10), parseInt(employeeId, 10)]);
   const sql = 'INSERT INTO task_employees (task_id, employee_id) VALUES ?';
 
   db.query(sql, [insertValues], (err, result) => {
@@ -335,35 +330,6 @@ app.post('/tasks/:taskId/employees', (req, res) => {
     }
 
     res.status(201).json({ message: 'Сотрудники успешно добавлены к задаче' });
-  });
-});
-
-
-// Маршрут для добавления нового клиента
-app.post('/add-client', (req, res) => {
-
-  const fullUrl = req.protocol + '://' + req.get('host') + req.originalUrl;
-  logger.info('Полный URL-адрес запроса:', fullUrl);
-  // Извлекаем данные клиента из тела запроса
-  const { full_name, phone_number, email, address, source, comment } = req.body;
-
-  // Проверяем, что все необходимые данные были предоставлены
-  if (!full_name || !phone_number || !email || !address || !source || !comment) {
-    return res.status(400).json({ error: 'Все поля клиента должны быть заполнены' });
-  }
-
-  // SQL-запрос для вставки нового клиента в таблицу "clients"
-  const sql = 'INSERT INTO clients (full_name, phone_number, email, address, source, comment) VALUES (?, ?, ?, ?, ?, ?)';
-
-  // Выполняем SQL-запрос
-  db.query(sql, [full_name, phone_number, email, address, source, comment], (err, result) => {
-    if (err) {
-      logger.error('Ошибка при добавлении клиента в базу данных:', err.message);
-      return res.status(500).json({ error: 'Ошибка при добавлении клиента' });
-    }
-
-    // Если клиент успешно добавлен, возвращаем успешный ответ
-    res.status(201).json({ message: 'Клиент успешно добавлен', client_id: result.insertId });
   });
 });
 
