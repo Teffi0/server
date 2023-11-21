@@ -16,9 +16,9 @@ const dbConfig = {
     queueLimit: 0,
 };
 
-const pool = mysql.createPool(dbConfig);
+const db = mysql.createPool(dbConfig);
 
-pool.getConnection((err, connection) => {
+db.getConnection((err, connection) => {
     if (err) {
         logger.error('Ошибка подключения к базе данных: ' + err.message);
     } else {
@@ -28,7 +28,7 @@ pool.getConnection((err, connection) => {
 
 });
 
-pool.on('error', (err) => {
+db.on('error', (err) => {
     logger.error('Ошибка MySQL: ' + err.message);
 
     if (err.code === 'PROTOCOL_CONNECTION_LOST') {
@@ -44,7 +44,7 @@ pool.on('error', (err) => {
 
 
 function handleDatabaseConnectionError(err) {
-    pool.connect((reconnectError) => {
+    db.connect((reconnectError) => {
         if (reconnectError) {
             logger.error('Ошибка переподключения к базе данных: ' + reconnectError.message);
             process.exit(1);
@@ -57,4 +57,4 @@ function handleDatabaseError(err) {
     logger.error('Ошибка базы данных: ' + err.message);
 }
 
-module.exports = pool;
+module.exports = db;

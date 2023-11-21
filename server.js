@@ -18,7 +18,7 @@ app.use(express.urlencoded({ extended: true }));
 app.use(morgan('combined', { stream: { write: message => logger.info(message) } }));
 
 function errorHandler(err, req, res, next) {
-  logger.error(err.stack); 
+  logger.error(err.stack);
 
   const statusCode = err.statusCode || 500;
 
@@ -33,13 +33,21 @@ function errorHandler(err, req, res, next) {
 
 function executeQuery(sql, params = []) {
   return new Promise((resolve, reject) => {
-    db.query(sql, params, (err, results) => {
+    db.getConnection((err, connection) => {
       if (err) {
-        logger.error('Ошибка при выполнении запроса к базе данных:', err.message);
+        logger.error('Ошибка получения соединения из пула:', err.message);
         reject(err);
-      } else {
-        resolve(results);
+        return;
       }
+      connection.query(sql, params, (queryErr, results) => {
+        connection.release(); // Освобождаем соединение в любом случае после запроса
+        if (queryErr) {
+          logger.error('Ошибка при выполнении запроса к базе данных:', queryErr.message);
+          reject(queryErr);
+        } else {
+          resolve(results);
+        }
+      });
     });
   });
 }
@@ -137,6 +145,18 @@ app.get('/task-dates', async (req, res) => {
     res.status(500).json({ error: 'Внутренняя ошибка сервера' });
   }
 });
+
+app.get('/inventory', async (req, res) => {
+  try {
+    const sql = 'SELECT * FROM inventory';
+    const results = await executeQuery(sql);
+    res.status(200).json(results);
+  } catch (err) {
+    logger.error('Ошибка при получении инвентаря:', err.message);
+    res.status(500).json({ error: 'Ошибка при получении инвентаря' });
+  }
+});
+
 
 app.get('/task-participants/:taskId', (req, res) => {
   const { taskId } = req.params;
@@ -243,6 +263,52 @@ app.post('/tasks', (req, res) => {
   }
 });
 
+app.post('/tasks/:taskId/inventory', async (req, res) => {
+  const { taskId } = req.params;
+  const { inventory } = req.body;
+
+  if (!inventory || !inventory.length) {
+    return res.status(400).json({ error: 'Необходимо предоставить массив инвентаря.' });
+  }
+
+  db.getConnection((connErr, connection) => {
+    if (connErr) {
+      logger.error('Ошибка получения соединения из пула:', connErr.message);
+      return res.status(500).json({ error: 'Ошибка при подключении к базе данных.' });
+    }
+
+    connection.beginTransaction((transactionErr) => {
+      if (transactionErr) {
+        connection.release();
+        logger.error('Ошибка при начале транзакции:', transactionErr.message);
+        return res.status(500).json({ error: 'Ошибка при начале транзакции.' });
+      }
+
+      try {
+        // Выполняем запросы здесь, используя объект соединения, например:
+        // connection.query(...)
+        // ...
+
+        // После всех запросов фиксируем транзакцию
+        connection.commit((commitErr) => {
+          if (commitErr) {
+            throw commitErr; // Сгенерирует ошибку и перейдет к блоку catch
+          }
+          connection.release(); // Не забудь освободить соединение после завершения!
+          res.status(201).json({ message: 'Инвентарь успешно добавлен и обновлен.' });
+        });
+      } catch (error) {
+        // В случае ошибки откатываем транзакцию
+        connection.rollback(() => {
+          connection.release(); // Освобождаем соединение
+          res.status(500).json({ error: 'Ошибка при добавлении инвентаря.' });
+        });
+      }
+    });
+  });
+});
+
+
 
 app.put('/tasks/:taskId', (req, res) => {
   const { taskId } = req.params;
@@ -259,6 +325,69 @@ app.put('/tasks/:taskId', (req, res) => {
     res.status(200).json({ message: 'Статус задачи успешно обновлен' });
   });
 });
+
+app.put('/tasks/:taskId/complete', (req, res) => {
+  const { taskId } = req.params;
+  const inventoryItems = req.body.inventory; // Предполагается, что в теле запроса передается массив объектов инвентаря
+
+  if (!inventoryItems || !inventoryItems.length) {
+    return res.status(400).json({ error: 'Необходимо предоставить данные об инвентаре.' });
+  }
+
+  db.getConnection((connErr, connection) => {
+    if (connErr) {
+      logger.error('Ошибка получения соединения из пула:', connErr.message);
+      return res.status(500).json({ error: 'Ошибка при подключении к базе данных.' });
+    }
+
+    connection.beginTransaction(async (transactionErr) => {
+      if (transactionErr) {
+        connection.release();
+        logger.error('Ошибка при начале транзакции:', transactionErr.message);
+        return res.status(500).json({ error: 'Ошибка при начале транзакции.' });
+      }
+
+      try {
+        // Обновляем статус задачи
+        const updateTaskSql = 'UPDATE tasks SET status = "выполнено" WHERE id = ?';
+        await new Promise((resolve, reject) => {
+          connection.query(updateTaskSql, [taskId], (queryErr, results) => {
+            if (queryErr) reject(queryErr);
+            else resolve(results);
+          });
+        });
+
+        // Вычитаем количество инвентаря
+        for (const item of inventoryItems) {
+          const updateInventorySql = 'UPDATE inventory SET quantity = GREATEST(0, quantity - ?) WHERE id = ?';
+          await new Promise((resolve, reject) => {
+            connection.query(updateInventorySql, [item.quantity, item.inventory_id], (queryErr, results) => {
+              if (queryErr) reject(queryErr);
+              else resolve(results);
+            });
+          });
+        }
+
+        connection.commit((commitErr) => {
+          if (commitErr) {
+            throw commitErr; // Сгенерирует ошибку и перейдет к блоку catch
+          }
+          connection.release(); // Освобождаем соединение после коммита
+          res.status(200).json({ message: 'Задача выполнена и инвентарь обновлён' });
+        });
+      } catch (error) {
+        // В случае ошибки откатываем транзакцию
+        connection.rollback(() => {
+          connection.release(); // Освобождаем соединение после отката
+          logger.error('Ошибка при выполнении запросов, откатываем изменения:', error.message);
+          res.status(500).json({ error: 'Ошибка при выполнении запросов, откатываем изменения' });
+        });
+      }
+    });
+  });
+});
+
+
 
 app.put('/clients/:clientId', (req, res) => {
   const { clientId } = req.params;
