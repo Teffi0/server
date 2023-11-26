@@ -54,11 +54,12 @@ function executeQuery(sql, params = []) {
 
 app.get('/services', async (req, res) => {
   try {
-    const sql = 'SELECT service_name FROM services';
+    // Используем * для выбора всех полей из таблицы services
+    const sql = 'SELECT * FROM services';
     const results = await executeQuery(sql);
 
-    const serviceNames = results.map(result => result.service_name);
-    res.status(200).json(serviceNames);
+    // Передаём в ответ весь массив результатов
+    res.status(200).json(results);
   } catch (err) {
     res.status(500).json({ error: 'Внутренняя ошибка сервера' });
   }
@@ -135,16 +136,54 @@ app.get('/tasks', async (req, res) => {
   }
 });
 
+// Этот маршрут получает черновик задачи по её ID
+app.get('/tasks/draft/:taskId', async (req, res) => {
+  try {
+    const { taskId } = req.params;
+    const sql = 'SELECT * FROM tasks WHERE id = ? AND status = "черновик"';
+    const results = await executeQuery(sql, [taskId]);
+
+    if (results.length === 0) {
+      return res.status(404).json({ error: 'Черновик не найден' });
+    }
+
+    res.status(200).json(results[0]);
+  } catch (err) {
+    res.status(500).json({ error: 'Внутренняя ошибка сервера' });
+  }
+});
+
+
 app.get('/task-dates', async (req, res) => {
   try {
-    const sql = 'SELECT DISTINCT DATE(start_date) AS task_date FROM tasks';
+    // Запрос для получения дат и статусов задач
+    const sql = `
+      SELECT 
+        DATE(start_date) AS task_date, 
+        status 
+      FROM tasks
+      WHERE status IN ('новая', 'в процессе')`;
+
     const results = await executeQuery(sql);
-    const taskDates = results.map(result => result.task_date);
+
+    // Структурирование результатов в объект, где ключами будут даты, а значениями - статусы задач
+    const taskDates = results.reduce((acc, result) => {
+      // Форматируем дату в строку
+      const formattedDate = result.task_date.toISOString().split('T')[0];
+
+      if (!acc[formattedDate]) {
+        acc[formattedDate] = result.status;
+      }
+
+      return acc;
+    }, {});
+
     res.status(200).json(taskDates);
   } catch (err) {
     res.status(500).json({ error: 'Внутренняя ошибка сервера' });
   }
 });
+
 
 app.get('/inventory', async (req, res) => {
   try {
@@ -177,20 +216,65 @@ app.get('/task-participants/:taskId', (req, res) => {
   });
 });
 
-app.post('/tasks', (req, res) => {
-  try {
-    const { status, service, payment, cost, start_date, end_date, start_time, end_time, responsible, fullname_client, address_client, phone, description, employees } = req.body;
+app.post('/tasks/:taskId/services', async (req, res) => {
+  const { taskId } = req.params;
+  const { services } = req.body;
 
-    if (!status || !service || !payment || !cost || !start_date || !end_date || !start_time || !end_time || !responsible || !fullname_client || !address_client || !phone || !description) {
+  if (!services || !services.length) {
+    return res.status(400).json({ error: 'Необходимо предоставить массив ID услуг.' });
+  }
+
+  try {
+    const insertValues = services.map(serviceId => [parseInt(taskId, 10), parseInt(serviceId, 10)]);
+    const sql = 'INSERT INTO task_services (task_id, service_id) VALUES ?';
+
+    await executeQuery(sql, [insertValues]);
+    res.status(201).json({ message: 'Услуги успешно добавлены к задаче' });
+  } catch (err) {
+    logger.error('Ошибка при добавлении услуг к задаче:', err.message);
+    res.status(500).json({ error: 'Ошибка при добавлении услуг к задаче' });
+  }
+});
+
+app.get('/tasks/:taskId/services', async (req, res) => {
+  const { taskId } = req.params;
+
+  try {
+    const sql = `
+      SELECT s.* FROM services s
+      INNER JOIN task_services ts ON s.id = ts.service_id
+      WHERE ts.task_id = ?
+    `;
+
+    const services = await executeQuery(sql, [taskId]);
+    res.status(200).json(services);
+  } catch (err) {
+    logger.error('Ошибка при получении услуг задачи:', err.message);
+    res.status(500).json({ error: 'Ошибка при получении услуг задачи' });
+  }
+});
+
+
+app.post('/tasks', async (req, res) => {
+  try {
+    const {
+      status, service, payment, cost, start_date, end_date, start_time,
+      end_time, responsible, fullname_client, address_client, phone,
+      description, employees, services
+    } = req.body;
+
+    // Проверка обязательных полей
+    if (status !== 'черновик' && (!service || !payment || !cost || !start_date || !end_date || !start_time || !end_time || !responsible || !fullname_client || !address_client || !phone || !description)) {
       logger.error('Ошибка: Не все поля задачи заполнены');
       return res.status(400).json({ error: 'Не все поля задачи заполнены' });
     }
 
+    // SQL запрос для добавления задачи
     const taskSql = `
-    INSERT INTO tasks
-    (status, service, payment, cost, start_date, end_date, start_time, end_time, responsible, fullname_client, address_client, phone, description)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `;
+      INSERT INTO tasks
+      (status, service, payment, cost, start_date, end_date, start_time, end_time, responsible, fullname_client, address_client, phone, description)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `;
 
     db.query(taskSql, [status, service, payment, cost, start_date, end_date, start_time, end_time, responsible, fullname_client, address_client, phone, description], (err, taskResult) => {
       if (err) {
@@ -308,23 +392,126 @@ app.post('/tasks/:taskId/inventory', async (req, res) => {
   });
 });
 
+app.post('/services/names', async (req, res) => {
+  try {
+    const serviceIds = req.body.ids;
 
-
-app.put('/tasks/:taskId', (req, res) => {
-  const { taskId } = req.params;
-  const { status } = req.body;
-
-  const sql = 'UPDATE tasks SET status = ? WHERE id = ?';
-
-  db.query(sql, [status, taskId], (err, result) => {
-    if (err) {
-      logger.error('Ошибка при обновлении статуса задачи:', err.message);
-      return res.status(500).json({ error: 'Ошибка при обновлении статуса задачи' });
+    // Проверяем, что serviceIds - это массив чисел
+    if (!Array.isArray(serviceIds) || !serviceIds.every(id => typeof id === 'number')) {
+      return res.status(400).json({ error: 'ids должен быть массивом чисел' });
     }
 
-    res.status(200).json({ message: 'Статус задачи успешно обновлен' });
-  });
+    // Создаем строку для запроса с плейсхолдерами
+    const placeholders = serviceIds.map(() => '?').join(',');
+    const sql = `SELECT id, service_name FROM services WHERE id IN (${placeholders})`;
+
+    const results = await executeQuery(sql, serviceIds);
+
+    // Проверяем, что каждый ID нашёл соответствие
+    const services = serviceIds.map(id =>
+      results.find(service => service.id === id) || { id, service_name: 'Услуга не найдена' }
+    );
+
+    res.status(200).json(services);
+  } catch (err) {
+    logger.error('Ошибка при получении названий услуг:', err.message);
+    res.status(500).json({ error: 'Ошибка при получении названий услуг' });
+  }
 });
+
+
+app.put('/tasks/:taskId', async (req, res) => {
+  const { taskId } = req.params;
+  const {
+    status,
+    service,
+    payment,
+    cost,
+    start_date,
+    end_date,
+    start_time,
+    end_time,
+    responsible,
+    fullname_client,
+    address_client,
+    phone,
+    description,
+    employees,
+    services
+  } = req.body;
+
+  if (status === "новая") {
+    // Если в теле запроса только статус, обновляем только его
+    try {
+      const sql = 'UPDATE tasks SET status = ? WHERE id = ?';
+      await executeQuery(sql, [status, taskId]);
+      res.status(200).json({ message: 'Статус задачи успешно обновлен.' });
+    } catch (error) {
+      logger.error('Ошибка при обновлении статуса задачи:', error.message);
+      res.status(500).json({ error: 'Ошибка при обновлении статуса задачи.' });
+    }
+  } else {
+    // Начинаем транзакцию
+    db.getConnection((connErr, connection) => {
+      if (connErr) {
+        logger.error('Ошибка получения соединения:', connErr.message);
+        return res.status(500).json({ error: 'Ошибка при подключении к базе данных.' });
+      }
+
+      connection.beginTransaction(async (transactionErr) => {
+        if (transactionErr) {
+          connection.release();
+          logger.error('Ошибка при начале транзакции:', transactionErr.message);
+          return res.status(500).json({ error: 'Ошибка при начале транзакции.' });
+        }
+
+        try {
+          // Обновление основных данных задачи
+          const updateTaskSql = `
+          UPDATE tasks SET
+            status = ?, service = ?, payment = ?, cost = ?, 
+            start_date = ?, end_date = ?, start_time = ?, 
+            end_time = ?, responsible = ?, fullname_client = ?, 
+            address_client = ?, phone = ?, description = ?
+          WHERE id = ?;
+        `;
+          await executeQuery(updateTaskSql, [
+            status, service, payment, cost, start_date, end_date, start_time,
+            end_time, responsible, fullname_client, address_client, phone,
+            description, taskId
+          ]);
+
+          console.log(status, end_date, start_time);
+          // Удаление существующих связей услуг и задачи
+          const deleteExistingServicesSql = 'DELETE FROM task_services WHERE task_id = ?';
+          await executeQuery(deleteExistingServicesSql, [taskId]);
+
+          // Добавление новых услуг, если они предоставлены
+          if (services && services.length) {
+            const insertServicesSql = 'INSERT INTO task_services (task_id, service_id) VALUES ?';
+            const servicesValues = services.map(serviceId => [taskId, serviceId]);
+            await executeQuery(insertServicesSql, [servicesValues]);
+          }
+
+          // Подтверждение транзакции
+          connection.commit((commitErr) => {
+            if (commitErr) throw commitErr;
+            connection.release();
+            res.status(200).json({ message: 'Задача успешно обновлена.' });
+          });
+        } catch (error) {
+          // Откат транзакции в случае ошибки
+          connection.rollback(() => {
+            connection.release();
+            logger.error('Ошибка при обновлении задачи:', error.message);
+            res.status(500).json({ error: 'Ошибка при обновлении задачи.' });
+          });
+        }
+      });
+    });
+  }
+});
+
 
 app.put('/tasks/:taskId/complete', (req, res) => {
   const { taskId } = req.params;
