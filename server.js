@@ -200,7 +200,7 @@ app.get('/inventory', async (req, res) => {
 app.get('/task-participants/:taskId', (req, res) => {
   const { taskId } = req.params;
   const query = `
-    SELECT e.full_name
+    SELECT e.id, e.full_name
     FROM employees e
     INNER JOIN task_employees te ON e.id = te.employee_id
     WHERE te.task_id = ?
@@ -211,10 +211,11 @@ app.get('/task-participants/:taskId', (req, res) => {
       console.error('Ошибка при выполнении запроса:', err.message);
       res.status(500).send('Ошибка сервера при получении участников задачи');
     } else {
-      res.status(200).json(results.map(row => row.full_name));
+      res.status(200).json(results);
     }
   });
 });
+
 
 app.post('/tasks/:taskId/services', async (req, res) => {
   const { taskId } = req.params;
@@ -311,15 +312,6 @@ app.post('/tasks', async (req, res) => {
             }
           });
 
-        });
-        db.query('SELECT task_id, COUNT(employee_id) as employee_count FROM task_employees GROUP BY task_id', (err, results) => {
-          if (err) {
-            logger.error('Ошибка при подсчете участников для каждого task_id:', err.message);
-          } else {
-            results.forEach((row) => {
-              logger.info(`Задача ${row.task_id} имеет ${row.employee_count} участников`);
-            });
-          }
         });
         db.query('SELECT task_id, COUNT(employee_id) as employee_count FROM task_employees GROUP BY task_id', (err, results) => {
           if (err) {
@@ -481,7 +473,33 @@ app.put('/tasks/:taskId', async (req, res) => {
             description, taskId
           ]);
 
-          console.log(status, end_date, start_time);
+          if (employees) {
+            const employeeIds = employees.split(',').map(id => parseInt(id.trim(), 10));
+            const deleteOldLinksSql = 'DELETE FROM task_employees WHERE task_id = ?';
+            await executeQuery(deleteOldLinksSql, [taskId]);
+      
+            const insertNewLinksSql = 'INSERT INTO task_employees (task_id, employee_id) VALUES ?';
+            const newLinksValues = employeeIds.map(employeeId => [taskId, employeeId]);
+            await executeQuery(insertNewLinksSql, [newLinksValues]);
+
+            db.query('SELECT task_id, COUNT(employee_id) as employee_count FROM task_employees GROUP BY task_id', (err, results) => {
+              if (err) {
+                logger.error('Ошибка при подсчете участников:', err.message);
+              } else {
+                results.forEach((row) => {
+                  db.query('UPDATE tasks SET employees = ? WHERE id = ?', [row.employee_count, row.task_id], (updateErr) => {
+                    if (updateErr) {
+                      logger.error('Ошибка при обновлении количества участников:', updateErr.message);
+                    } else {
+                      logger.info(`Количество участников для задачи ${row.task_id} обновлено: ${row.employee_count}`);
+                    }
+                  });
+                });
+              }
+            });
+          }
+
+          console.log(status, employees);
           // Удаление существующих связей услуг и задачи
           const deleteExistingServicesSql = 'DELETE FROM task_services WHERE task_id = ?';
           await executeQuery(deleteExistingServicesSql, [taskId]);
