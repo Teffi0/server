@@ -432,103 +432,74 @@ app.put('/tasks/:taskId', async (req, res) => {
     services
   } = req.body;
 
-  if (status === "новая") {
-    // Если в теле запроса только статус, обновляем только его
-    try {
-      const sql = 'UPDATE tasks SET status = ? WHERE id = ?';
-      await executeQuery(sql, [status, taskId]);
-      res.status(200).json({ message: 'Статус задачи успешно обновлен.' });
-    } catch (error) {
-      logger.error('Ошибка при обновлении статуса задачи:', error.message);
-      res.status(500).json({ error: 'Ошибка при обновлении статуса задачи.' });
+  db.getConnection((connErr, connection) => {
+    if (connErr) {
+      logger.error('Ошибка получения соединения:', connErr.message);
+      return res.status(500).json({ error: 'Ошибка при подключении к базе данных.' });
     }
-  } else {
-    // Начинаем транзакцию
-    db.getConnection((connErr, connection) => {
-      if (connErr) {
-        logger.error('Ошибка получения соединения:', connErr.message);
-        return res.status(500).json({ error: 'Ошибка при подключении к базе данных.' });
+
+    connection.beginTransaction(async (transactionErr) => {
+      if (transactionErr) {
+        connection.release();
+        logger.error('Ошибка при начале транзакции:', transactionErr.message);
+        return res.status(500).json({ error: 'Ошибка при начале транзакции.' });
       }
 
-      connection.beginTransaction(async (transactionErr) => {
-        if (transactionErr) {
-          connection.release();
-          logger.error('Ошибка при начале транзакции:', transactionErr.message);
-          return res.status(500).json({ error: 'Ошибка при начале транзакции.' });
+      try {
+        // Обновление основных данных задачи
+        const updateTaskSql = `
+        UPDATE tasks SET
+          status = ?, service = ?, payment = ?, cost = ?, 
+          start_date = ?, end_date = ?, start_time = ?, 
+          end_time = ?, responsible = ?, fullname_client = ?, 
+          address_client = ?, phone = ?, description = ?
+        WHERE id = ?;
+        `;
+        await executeQuery(updateTaskSql, [
+          status, service, payment, cost, start_date, end_date, start_time,
+          end_time, responsible, fullname_client, address_client, phone,
+          description, taskId
+        ]);
+
+        // Обработка списка сотрудников
+        if (employees) {
+          const employeeIds = employees.split(',').map(id => parseInt(id.trim(), 10));
+          const deleteOldLinksSql = 'DELETE FROM task_employees WHERE task_id = ?';
+          await executeQuery(deleteOldLinksSql, [taskId]);
+    
+          const insertNewLinksSql = 'INSERT INTO task_employees (task_id, employee_id) VALUES ?';
+          const newLinksValues = employeeIds.map(employeeId => [taskId, employeeId]);
+          await executeQuery(insertNewLinksSql, [newLinksValues]);
         }
 
-        try {
-          // Обновление основных данных задачи
-          const updateTaskSql = `
-          UPDATE tasks SET
-            status = ?, service = ?, payment = ?, cost = ?, 
-            start_date = ?, end_date = ?, start_time = ?, 
-            end_time = ?, responsible = ?, fullname_client = ?, 
-            address_client = ?, phone = ?, description = ?
-          WHERE id = ?;
-        `;
-          await executeQuery(updateTaskSql, [
-            status, service, payment, cost, start_date, end_date, start_time,
-            end_time, responsible, fullname_client, address_client, phone,
-            description, taskId
-          ]);
-
-          if (employees) {
-            const employeeIds = employees.split(',').map(id => parseInt(id.trim(), 10));
-            const deleteOldLinksSql = 'DELETE FROM task_employees WHERE task_id = ?';
-            await executeQuery(deleteOldLinksSql, [taskId]);
-      
-            const insertNewLinksSql = 'INSERT INTO task_employees (task_id, employee_id) VALUES ?';
-            const newLinksValues = employeeIds.map(employeeId => [taskId, employeeId]);
-            await executeQuery(insertNewLinksSql, [newLinksValues]);
-
-            db.query('SELECT task_id, COUNT(employee_id) as employee_count FROM task_employees GROUP BY task_id', (err, results) => {
-              if (err) {
-                logger.error('Ошибка при подсчете участников:', err.message);
-              } else {
-                results.forEach((row) => {
-                  db.query('UPDATE tasks SET employees = ? WHERE id = ?', [row.employee_count, row.task_id], (updateErr) => {
-                    if (updateErr) {
-                      logger.error('Ошибка при обновлении количества участников:', updateErr.message);
-                    } else {
-                      logger.info(`Количество участников для задачи ${row.task_id} обновлено: ${row.employee_count}`);
-                    }
-                  });
-                });
-              }
-            });
-          }
-
-          console.log(status, employees);
-          // Удаление существующих связей услуг и задачи
+        // Обработка списка услуг
+        if (services && services.length) {
           const deleteExistingServicesSql = 'DELETE FROM task_services WHERE task_id = ?';
           await executeQuery(deleteExistingServicesSql, [taskId]);
 
-          // Добавление новых услуг, если они предоставлены
-          if (services && services.length) {
-            const insertServicesSql = 'INSERT INTO task_services (task_id, service_id) VALUES ?';
-            const servicesValues = services.map(serviceId => [taskId, serviceId]);
-            await executeQuery(insertServicesSql, [servicesValues]);
-          }
-
-          // Подтверждение транзакции
-          connection.commit((commitErr) => {
-            if (commitErr) throw commitErr;
-            connection.release();
-            res.status(200).json({ message: 'Задача успешно обновлена.' });
-          });
-        } catch (error) {
-          // Откат транзакции в случае ошибки
-          connection.rollback(() => {
-            connection.release();
-            logger.error('Ошибка при обновлении задачи:', error.message);
-            res.status(500).json({ error: 'Ошибка при обновлении задачи.' });
-          });
+          const insertServicesSql = 'INSERT INTO task_services (task_id, service_id) VALUES ?';
+          const servicesValues = services.map(serviceId => [taskId, serviceId]);
+          await executeQuery(insertServicesSql, [servicesValues]);
         }
-      });
+
+        // Подтверждение транзакции
+        connection.commit((commitErr) => {
+          if (commitErr) throw commitErr;
+          connection.release();
+          res.status(200).json({ message: 'Задача успешно обновлена.' });
+        });
+      } catch (error) {
+        // Откат транзакции в случае ошибки
+        connection.rollback(() => {
+          connection.release();
+          logger.error('Ошибка при обновлении задачи:', error.message);
+          res.status(500).json({ error: 'Ошибка при обновлении задачи.' });
+        });
+      }
     });
-  }
+  });
 });
+
 
 
 app.put('/tasks/:taskId/complete', (req, res) => {
@@ -553,20 +524,20 @@ app.put('/tasks/:taskId/complete', (req, res) => {
       }
 
       try {
-        // Обновляем статус задачи
-        const updateTaskSql = 'UPDATE tasks SET status = "выполнено" WHERE id = ?';
-        await new Promise((resolve, reject) => {
-          connection.query(updateTaskSql, [taskId], (queryErr, results) => {
-            if (queryErr) reject(queryErr);
-            else resolve(results);
-          });
-        });
-
         // Вычитаем количество инвентаря
         for (const item of inventoryItems) {
           const updateInventorySql = 'UPDATE inventory SET quantity = GREATEST(0, quantity - ?) WHERE id = ?';
           await new Promise((resolve, reject) => {
             connection.query(updateInventorySql, [item.quantity, item.inventory_id], (queryErr, results) => {
+              if (queryErr) reject(queryErr);
+              else resolve(results);
+            });
+          });
+
+          // Добавляем запись в task_inventory
+          const insertTaskInventorySql = 'INSERT INTO task_inventory (task_id, inventory_id, quantity) VALUES (?, ?, ?)';
+          await new Promise((resolve, reject) => {
+            connection.query(insertTaskInventorySql, [taskId, item.inventory_id, item.quantity], (queryErr, results) => {
               if (queryErr) reject(queryErr);
               else resolve(results);
             });
@@ -591,6 +562,7 @@ app.put('/tasks/:taskId/complete', (req, res) => {
     });
   });
 });
+
 
 
 
