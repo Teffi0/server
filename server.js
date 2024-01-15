@@ -1,6 +1,9 @@
 const express = require('express');
 const multer = require('multer');
 const path = require('path');
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
+const { validateLoginInput, validateRegistrationInput } = require('./validation');
 const admin = require('firebase-admin');
 const db = require('./config/database');
 const morgan = require('morgan');
@@ -76,7 +79,7 @@ app.post('/tasks/:taskId/photos', upload.array('photos', 20), async (req, res) =
   try {
     // Проверяем наличие существующих фотографий для задачи
     const existingPhotos = await executeQuery("SELECT * FROM task_photos WHERE task_id = ?", [taskId]);
-    
+
     if (existingPhotos.length > 0) {
       // Удаляем существующие фотографии из файловой системы
       existingPhotos.forEach(photo => {
@@ -147,55 +150,156 @@ app.put('/tasks/:taskId/inventory', async (req, res) => {
   const newInventory = req.body.inventory;
 
   if (!newInventory) {
-      return res.status(400).json({ error: 'Необходимо предоставить массив инвентаря.' });
+    return res.status(400).json({ error: 'Необходимо предоставить массив инвентаря.' });
   }
 
   db.getConnection((connErr, connection) => {
-      if (connErr) {
-          return res.status(500).json({ error: 'Ошибка при подключении к базе данных.' });
+    if (connErr) {
+      return res.status(500).json({ error: 'Ошибка при подключении к базе данных.' });
+    }
+
+    connection.beginTransaction(async (transactionErr) => {
+      if (transactionErr) {
+        connection.release();
+        return res.status(500).json({ error: 'Ошибка при начале транзакции.' });
       }
+      console.log(newInventory);
+      try {
+        // Получаем текущие данные инвентаря для задачи
+        const oldInventoryData = await executeQuery('SELECT inventory_id, quantity FROM task_inventory WHERE task_id = ?', [taskId], connection);
 
-      connection.beginTransaction(async (transactionErr) => {
-          if (transactionErr) {
-              connection.release();
-              return res.status(500).json({ error: 'Ошибка при начале транзакции.' });
+        // Восстанавливаем количество инвентаря на складе на основе старых данных
+        for (const oldItem of oldInventoryData) {
+          await executeQuery('UPDATE inventory SET quantity = quantity + ? WHERE id = ?', [oldItem.quantity, oldItem.inventory_id], connection);
+        }
+
+        // Удаление старых данных
+        await executeQuery('DELETE FROM task_inventory WHERE task_id = ?', [taskId], connection);
+
+        // Обновление данных инвентаря и уменьшение количества на складе
+        for (const newItem of newInventory) {
+          await executeQuery('UPDATE inventory SET quantity = quantity - ? WHERE id = ?', [newItem.quantity, newItem.inventory_id], connection);
+          await executeQuery('INSERT INTO task_inventory (task_id, inventory_id, quantity) VALUES (?, ?, ?)', [taskId, newItem.inventory_id, newItem.quantity], connection);
+        }
+
+        connection.commit((commitErr) => {
+          if (commitErr) {
+            throw commitErr; // Вызовет ошибку, которая будет перехвачена ниже
           }
-          console.log(newInventory);
-          try {
-              // Получаем текущие данные инвентаря для задачи
-              const oldInventoryData = await executeQuery('SELECT inventory_id, quantity FROM task_inventory WHERE task_id = ?', [taskId], connection);
-
-              // Восстанавливаем количество инвентаря на складе на основе старых данных
-              for (const oldItem of oldInventoryData) {
-                  await executeQuery('UPDATE inventory SET quantity = quantity + ? WHERE id = ?', [oldItem.quantity, oldItem.inventory_id], connection);
-              }
-
-              // Удаление старых данных
-              await executeQuery('DELETE FROM task_inventory WHERE task_id = ?', [taskId], connection);
-
-              // Обновление данных инвентаря и уменьшение количества на складе
-              for (const newItem of newInventory) {
-                  await executeQuery('UPDATE inventory SET quantity = quantity - ? WHERE id = ?', [newItem.quantity, newItem.inventory_id], connection);
-                  await executeQuery('INSERT INTO task_inventory (task_id, inventory_id, quantity) VALUES (?, ?, ?)', [taskId, newItem.inventory_id, newItem.quantity], connection);
-              }
-
-              connection.commit((commitErr) => {
-                  if (commitErr) {
-                      throw commitErr; // Вызовет ошибку, которая будет перехвачена ниже
-                  }
-                  connection.release();
-                  res.status(200).json({ message: 'Инвентарь успешно обновлен.' });
-              });
-          } catch (error) {
-              connection.rollback(() => {
-                  connection.release();
-                  res.status(500).json({ error: 'Ошибка при обновлении инвентаря.' });
-              });
-          }
-      });
+          connection.release();
+          res.status(200).json({ message: 'Инвентарь успешно обновлен.' });
+        });
+      } catch (error) {
+        connection.rollback(() => {
+          connection.release();
+          res.status(500).json({ error: 'Ошибка при обновлении инвентаря.' });
+        });
+      }
+    });
   });
 });
 
+app.post('/register', async (req, res) => {
+  const { errors, isValid } = validateRegistrationInput(req.body);
+
+  // Проверка валидности входных данных
+  if (!isValid) {
+    return res.status(400).json(errors);
+  }
+
+  const { username, password, full_name, phone_number, email, position, role } = req.body;
+
+  if (!username || !password) {
+    return res.status(400).json({ error: 'Необходимо указать имя пользователя и пароль.' });
+  }
+
+  try {
+    const hashedPassword = await bcrypt.hash(password, 10);
+    // Сохранение пользователя в базе данных
+    const userSql = 'INSERT INTO users (username, password) VALUES (?, ?)';
+    const userResult = await executeQuery(userSql, [username, hashedPassword]);
+    const userId = userResult.insertId; // ID вставленного пользователя
+
+    // Добавление в таблицу employees
+    const employeeSql = 'INSERT INTO employees (id, full_name, phone_number, email, position) VALUES (?, ?, ?, ?, ?)';
+    await executeQuery(employeeSql, [userId, full_name, phone_number, email, position]);
+
+    // При необходимости добавление в таблицу responsibles
+    if (role) {
+      const responsibleSql = 'INSERT INTO responsibles (id, full_name, phone_number, email, position) VALUES (?, ?, ?, ?, ?)';
+      await executeQuery(responsibleSql, [userId, full_name, phone_number, email, position]);
+    }
+
+    res.status(201).json({ message: 'Пользователь успешно зарегистрирован' });
+  } catch (error) {
+    // Убедитесь, что ваши логи пишутся в соответствующий файл или систему логирования
+    console.error('Ошибка при регистрации пользователя:', error);
+    res.status(500).json({ error: 'Ошибка при регистрации пользователя' });
+  }
+});
+
+app.post('/login', async (req, res) => {
+  const { errors, isValid } = validateLoginInput(req.body);
+
+  // Проверка валидности входных данных
+  if (!isValid) {
+    return res.status(400).json(errors);
+  }
+
+  const { username, password } = req.body;
+
+  if (!username || !password) {
+    return res.status(400).json({ error: 'Необходимо указать имя пользователя и пароль.' });
+  }
+
+  try {
+    const sql = 'SELECT * FROM users WHERE username = ?';
+    const users = await executeQuery(sql, [username]);
+    console.log(users);
+
+    if (users.length === 0) {
+      return res.status(401).json({ error: 'Неверное имя пользователя или пароль.' });
+    }
+
+    const user = users[0];
+    const isMatch = await bcrypt.compare(password, user.password);
+
+    if (!isMatch) {
+      return res.status(401).json({ error: 'Неверное имя пользователя или пароль.' });
+    }
+
+    const token = jwt.sign({ id: user.id }, process.env.JWT_SECRET, { expiresIn: '1h' });
+
+    res.json({ token: token, userId: user.id });
+  } catch (error) {
+    res.status(500).json({ error: 'Ошибка при аутентификации пользователя' });
+  }
+});
+
+app.get('/user/:userId/data', async (req, res) => {
+  const { userId } = req.params;
+
+  try {
+    const employeeData = await executeQuery("SELECT * FROM employees WHERE id = ?", [userId]);
+
+    console.log(employeeData);
+
+    if (employeeData.length > 0) {
+      // Отправляем данные сотрудника клиенту
+      res.status(200).json({
+        employee: employeeData[0]
+      });
+    } else {
+      // Если данных нет, отправляем соответствующий ответ
+      res.status(404).json({
+        message: 'Данные сотрудника не найдены.'
+      });
+    }
+  } catch (err) {
+    logger.error('Ошибка при получении данных пользователя:', err.message);
+    res.status(500).json({ error: 'Ошибка сервера при получении данных пользователя' });
+  }
+});
 
 app.get('/services', async (req, res) => {
   try {
@@ -258,6 +362,21 @@ app.get('/responsibles', async (req, res) => {
     res.status(200).json(employeeNames);
   } catch (err) {
     res.status(500).json({ error: 'Внутренняя ошибка сервера' });
+  }
+});
+
+app.get('/responsibles/check/:userId', async (req, res) => {
+  const { userId } = req.params;
+
+  try {
+    const sql = 'SELECT * FROM responsibles WHERE id = ?';
+    const result = await executeQuery(sql, [userId]);
+    const isResponsible = result.length > 0;
+
+    res.status(200).json({ isResponsible });
+  } catch (err) {
+    logger.error('Ошибка при проверке ответственности пользователя: ', err.message);
+    res.status(500).json({ error: 'Ошибка сервера при проверке ответственности пользователя' });
   }
 });
 
@@ -424,6 +543,39 @@ app.get('/tasks', async (req, res) => {
     const results = await executeQuery(sql, params);
     res.status(200).json(results);
   } catch (err) {
+    res.status(500).json({ error: 'Внутренняя ошибка сервера' });
+  }
+});
+
+app.get('/user_tasks', async (req, res) => {
+  try {
+    let userRole;
+    let userId;
+    
+    const token = req.headers.authorization.split(' ')[1];
+    console.log(token);
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    userId = decoded.id;
+    console.log(userId);
+
+    // Получаем роль пользователя из базы данных
+    const userRoleResult = await executeQuery('SELECT position FROM employees WHERE id = ?', [userId]);
+    userRole = userRoleResult[0].role;
+
+    console.log(userRole);
+    let sql = 'SELECT * FROM tasks';
+    let params = [];
+
+    // Если пользователь - монтажник, выбираем только те задачи, в которых он участвует
+    if (userRole === 'Монтажник') {
+      sql += ' INNER JOIN task_employees ON tasks.id = task_employees.task_id WHERE task_employees.employee_id = ?';
+      params.push(userId);
+    }
+
+    const tasks = await executeQuery(sql, params);
+    res.status(200).json(tasks);
+  } catch (err) {
+    logger.error('Ошибка при получении задач:', err.message);
     res.status(500).json({ error: 'Внутренняя ошибка сервера' });
   }
 });
@@ -596,83 +748,45 @@ app.post('/tasks', async (req, res) => {
     const {
       status, service, payment, cost, start_date, end_date, start_time,
       end_time, responsible, fullname_client, address_client, phone,
-      description, employees, services
+      description, employees
     } = req.body;
 
-    // Проверка обязательных полей
     if (status !== 'черновик' && (!service || !payment || !cost || !start_date || !end_date || !start_time || !end_time || !responsible || !fullname_client || !address_client || !phone || !description)) {
       logger.error('Ошибка: Не все поля задачи заполнены');
       return res.status(400).json({ error: 'Не все поля задачи заполнены' });
     }
 
-    // SQL запрос для добавления задачи
-    const taskSql = `
-      INSERT INTO tasks
-      (status, service, payment, cost, start_date, end_date, start_time, end_time, responsible, fullname_client, address_client, phone, description)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `;
+    const taskSql = `INSERT INTO tasks (status, service, payment, cost, start_date, end_date, start_time, end_time, responsible, fullname_client, address_client, phone, description) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+    const taskResult = await executeQuery(taskSql, [status, service, payment, cost, start_date, end_date, start_time, end_time, responsible, fullname_client, address_client, phone, description]);
+    const taskId = taskResult.insertId;
 
-    db.query(taskSql, [status, service, payment, cost, start_date, end_date, start_time, end_time, responsible, fullname_client, address_client, phone, description], (err, taskResult) => {
-      if (err) {
-        logger.error('Ошибка при добавлении задачи:', err.message);
-        return res.status(500).json({ error: 'Ошибка при добавлении задачи' });
+    if (employees && employees.length) {
+      const employeeExistenceResults = await executeQuery('SELECT id FROM employees WHERE id IN (?)', [employees]);
+      if (employeeExistenceResults.length !== employees.length) {
+        return res.status(400).json({ error: 'Один или несколько предоставленных ID сотрудников не существуют' });
       }
 
-      const taskId = taskResult.insertId;
+      const employeeTasksValues = employees.map(id => [taskId, id]);
+      await executeQuery('INSERT INTO task_employees (task_id, employee_id) VALUES ?', [employeeTasksValues]);
 
-      if (employees && employees.length) {
-        const checkEmployeesExistenceSql = 'SELECT id FROM employees WHERE id IN (?)';
-
-        db.query(checkEmployeesExistenceSql, [employees], (err, results) => {
-          if (err) {
-            logger.error('Ошибка при проверке существования сотрудников:', err.message);
-            return res.status(500).json({ error: 'Ошибка при проверке существования сотрудников' });
-          }
-
-          if (results.length !== employees.length) {
-            return res.status(400).json({ error: 'Один или несколько предоставленных ID сотрудников не существуют' });
-          }
-
-          const employeeTasksSql = 'INSERT INTO task_employees (task_id, employee_id) VALUES ?';
-          const employeeTasksValues = employees.map(id => [taskId, id]);
-
-          db.query(employeeTasksSql, [employeeTasksValues], (err) => {
-            if (err) {
-              logger.error('Ошибка при добавлении сотрудников к задаче:', err.message);
-              db.query('DELETE FROM tasks WHERE id = ?', [taskId], () => {
-                return res.status(500).json({ error: 'Ошибка при добавлении сотрудников к задаче' });
-              });
-            } else {
-              res.status(201).json({ message: 'Задача и связи с участниками успешно созданы', task_id: taskId });
-            }
-          });
-
-        });
-        db.query('SELECT task_id, COUNT(employee_id) as employee_count FROM task_employees GROUP BY task_id', (err, results) => {
-          if (err) {
-            logger.error('Ошибка при подсчете участников:', err.message);
-          } else {
-            results.forEach((row) => {
-              db.query('UPDATE tasks SET employees = ? WHERE id = ?', [row.employee_count, row.task_id], (updateErr) => {
-                if (updateErr) {
-                  logger.error('Ошибка при обновлении количества участников:', updateErr.message);
-                } else {
-                  logger.info(`Количество участников для задачи ${row.task_id} обновлено: ${row.employee_count}`);
-                }
-              });
-            });
-          }
-        });
-      } else {
-        logger.info('Задача добавлена без сотрудников');
-        res.status(201).json({ message: 'Задача успешно добавлена без участников', task_id: taskId });
+      const updateCountResults = await executeQuery('SELECT task_id, COUNT(employee_id) as employee_count FROM task_employees GROUP BY task_id');
+      for (const row of updateCountResults) {
+        if (row.task_id === taskId) {
+          await executeQuery('UPDATE tasks SET employees = ? WHERE id = ?', [row.employee_count, taskId]);
+        }
       }
-    });
+
+      res.status(201).json({ message: 'Задача и связи с участниками успешно созданы', task_id: taskId });
+    } else {
+      logger.info('Задача добавлена без сотрудников');
+      res.status(201).json({ message: 'Задача успешно добавлена без участников', task_id: taskId });
+    }
   } catch (err) {
     logger.error('Ошибка при добавлении задачи:', err.message);
     res.status(500).json({ error: 'Ошибка на сервере' });
   }
 });
+
 
 app.post('/tasks/:taskId/inventory', async (req, res) => {
   const { taskId } = req.params;
@@ -806,6 +920,7 @@ app.put('/tasks/:taskId', async (req, res) => {
           address_client = ?, phone = ?, description = ?
         WHERE id = ?;
         `;
+
         await executeQuery(updateTaskSql, [
           status, service, payment, cost, start_date, end_date, start_time,
           end_time, responsible, fullname_client, address_client, phone,
@@ -814,7 +929,7 @@ app.put('/tasks/:taskId', async (req, res) => {
 
         // Обработка списка сотрудников
         if (employees) {
-          const employeeIds = employees.split(',').map(id => parseInt(id.trim(), 10));
+          const employeeIds = employees.map(employee => employee.id);
           const deleteOldLinksSql = 'DELETE FROM task_employees WHERE task_id = ?';
           await executeQuery(deleteOldLinksSql, [taskId]);
 
