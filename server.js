@@ -336,18 +336,54 @@ app.get('/employees', async (req, res) => {
   }
 });
 
-app.post('/employees', async (req, res) => {
-  const { full_name, phone_number, email, position } = req.body;
+app.get('/employeesBase', async (req, res) => {
+  try {
+    const employeeSql = 'SELECT * FROM employees';
+    const employees = await executeQuery(employeeSql);
+    const usersSql = 'SELECT id, username, password FROM users';
+    const users = await executeQuery(usersSql);
+    const responsiblesSql = 'SELECT id FROM responsibles';
+    const responsibles = await executeQuery(responsiblesSql);
 
-  if (!full_name || !phone_number) {
-    return res.status(400).json({ error: 'ФИО и номер телефона являются обязательными полями.' });
+    const enhancedEmployees = employees.map(employee => {
+      const user = users.find(u => u.id === employee.id);
+      const isResponsible = responsibles.some(r => r.id === employee.id);
+      return {
+        ...employee,
+        username: user ? user.username : '',
+        password: user ? user.password : '',
+        isResponsible: isResponsible ? 'Да' : 'Нет'
+      };
+    });
+
+    res.status(200).json(enhancedEmployees);
+  } catch (err) {
+    res.status(500).json({ error: 'Внутренняя ошибка сервера' });
+  }
+});
+
+
+app.post('/employees', async (req, res) => {
+  const { full_name, phone_number, email, position, username, password } = req.body;
+
+  if (!full_name || !phone_number || !username || !password) {
+    return res.status(400).json({ error: 'ФИО, номер телефона, логин и пароль являются обязательными полями.' });
   }
 
   try {
-    const sql = 'INSERT INTO employees (full_name, phone_number, email, position) VALUES (?, ?, ?, ?)';
-    const result = await executeQuery(sql, [full_name, phone_number, email, position]);
-    await logEmployeeChange(result.insertId, 1, 'Добавлен новый сотрудник');
-    res.status(201).json({ message: 'Сотрудник успешно добавлен', employee_id: result.insertId });
+    // Хеширование пароля
+    const hashedPassword = await bcrypt.hash(password, 10);
+
+    // Добавление пользователя в таблицу users
+    const userSql = 'INSERT INTO users (username, password, created_at) VALUES (?, ?, NOW())';
+    const userResult = await executeQuery(userSql, [username, hashedPassword]);
+    const userId = userResult.insertId;
+
+    // Добавление сотрудника в таблицу employees
+    const employeeSql = 'INSERT INTO employees (id, full_name, phone_number, email, position) VALUES (?, ?, ?, ?, ?)';
+    await executeQuery(employeeSql, [userId, full_name, phone_number, email, position]);
+
+    res.status(201).json({ message: 'Сотрудник успешно добавлен', employee_id: userId });
   } catch (err) {
     logger.error('Ошибка при добавлении сотрудника:', err.message);
     res.status(500).json({ error: 'Ошибка при добавлении сотрудника' });
@@ -356,9 +392,23 @@ app.post('/employees', async (req, res) => {
 
 app.get('/responsibles', async (req, res) => {
   try {
-    const sql = 'SELECT full_name FROM responsibles';
-    const results = await executeQuery(sql);
+    const userId = parseInt(req.query.userId, 10);
+    let sql = 'SELECT full_name, position FROM responsibles WHERE id = ?';
+
+    let results;
+    if (userId) {
+      results = await executeQuery(sql, [userId]);
+      console.log(results);
+      if (results[0].position === 'Монтажник') {
+        return res.status(200).json([results[0].full_name]);
+      }
+    }
+
+    // Для всех остальных ролей возвращаем список всех ответственных
+    sql = 'SELECT full_name FROM responsibles';
+    results = await executeQuery(sql);
     const employeeNames = results.map(result => result.full_name);
+
     res.status(200).json(employeeNames);
   } catch (err) {
     res.status(500).json({ error: 'Внутренняя ошибка сервера' });
@@ -499,16 +549,54 @@ app.get('/tasks/:taskId/inventory', async (req, res) => {
 
 app.put('/employees/:employeeId', async (req, res) => {
   const { employeeId } = req.params;
-  const { full_name, phone_number, email, position } = req.body;
+  const { full_name, phone_number, email, position, isResponsible, username, password } = req.body;
+
+  console.log(full_name, phone_number, email, position, isResponsible, username, password);
 
   if (!full_name || !phone_number) {
     return res.status(400).json({ error: 'ФИО и номер телефона обязательны для обновления.' });
   }
 
   try {
-    const sql = 'UPDATE employees SET full_name = ?, phone_number = ?, email = ?, position = ? WHERE id = ?';
-    await executeQuery(sql, [full_name, phone_number, email, position, employeeId]);
-    await logEmployeeChange(employeeId, 1, 'Обновлены данные сотрудника');
+    // Обновляем данные в таблице employees
+    const sqlUpdateEmployee = 'UPDATE employees SET full_name = ?, phone_number = ?, email = ?, position = ? WHERE id = ?';
+    await executeQuery(sqlUpdateEmployee, [full_name, phone_number, email, position, employeeId]);
+
+    // Проверка и обновление статуса ответственного
+    const responsibleExists = await executeQuery('SELECT * FROM responsibles WHERE id = ?', [employeeId]);
+    if (isResponsible === 'Да') {
+      if (responsibleExists.length > 0) {
+        // Обновляем данные в таблице responsibles
+        const sqlUpdateResponsible = 'UPDATE responsibles SET full_name = ?, phone_number = ?, email = ?, position = ? WHERE id = ?';
+        await executeQuery(sqlUpdateResponsible, [full_name, phone_number, email, position, employeeId]);
+      } else {
+        // Добавляем запись в responsibles
+        const sqlInsertResponsible = 'INSERT INTO responsibles (id, full_name, phone_number, email, position) VALUES (?, ?, ?, ?, ?)';
+        await executeQuery(sqlInsertResponsible, [employeeId, full_name, phone_number, email, position]);
+      }
+    } else if (responsibleExists.length > 0) {
+      // Удаляем запись из responsibles
+      const sqlDeleteResponsible = 'DELETE FROM responsibles WHERE id = ?';
+      await executeQuery(sqlDeleteResponsible, [employeeId]);
+    }
+
+    if (username) {
+      let updateUserSql = 'UPDATE users SET username = ?';
+      let queryParams = [username];
+
+      // Проверка, является ли пароль хешем
+      if (password && !password.startsWith('$2b$')) {
+        const hashedPassword = await bcrypt.hash(password, 10);
+        updateUserSql += ', password = ?';
+        queryParams.push(hashedPassword);
+      }
+
+      updateUserSql += ' WHERE id = ?';
+      queryParams.push(employeeId);
+
+      await executeQuery(updateUserSql, queryParams);
+    }
+
     res.status(200).json({ message: 'Данные сотрудника успешно обновлены' });
   } catch (err) {
     logger.error('Ошибка при обновлении сотрудника:', err.message);
@@ -550,22 +638,23 @@ app.get('/tasks', async (req, res) => {
 app.get('/user_tasks', async (req, res) => {
   try {
     let userRole;
-    let userId;
-    
-    const token = req.headers.authorization.split(' ')[1];
-    console.log(token);
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    userId = decoded.id;
-    console.log(userId);
+    let userId = req.query.userId; // Получаем userId из параметров запроса
+    console.log(req.query);
+
+    if (!userId) {
+      return res.status(400).json({ error: 'Необходимо предоставить userId' });
+    }
+
+    userId = parseInt(userId, 10); // Преобразуем userId в число
 
     // Получаем роль пользователя из базы данных
     const userRoleResult = await executeQuery('SELECT position FROM employees WHERE id = ?', [userId]);
-    userRole = userRoleResult[0].role;
+    userRole = userRoleResult[0].position;
 
-    console.log(userRole);
     let sql = 'SELECT * FROM tasks';
     let params = [];
 
+    console.log(userRole);
     // Если пользователь - монтажник, выбираем только те задачи, в которых он участвует
     if (userRole === 'Монтажник') {
       sql += ' INNER JOIN task_employees ON tasks.id = task_employees.task_id WHERE task_employees.employee_id = ?';
@@ -579,6 +668,7 @@ app.get('/user_tasks', async (req, res) => {
     res.status(500).json({ error: 'Внутренняя ошибка сервера' });
   }
 });
+
 
 // Этот маршрут получает черновик задачи по её ID
 app.get('/tasks/draft/:taskId', async (req, res) => {
@@ -597,28 +687,47 @@ app.get('/tasks/draft/:taskId', async (req, res) => {
   }
 });
 
-
 app.get('/task-dates', async (req, res) => {
   try {
-    // Запрос для получения дат и статусов задач
-    const sql = `
-      SELECT 
-        DATE(start_date) AS task_date, 
-        status 
-      FROM tasks
-      WHERE status IN ('новая', 'в процессе')`;
+    const userId = parseInt(req.query.userId, 10);
 
-    const results = await executeQuery(sql);
+    let userRole;
+    // Получаем роль пользователя
+    if (userId) {
+      const userRoleResult = await executeQuery('SELECT position FROM employees WHERE id = ?', [userId]);
+      userRole = userRoleResult[0]?.position;
+    }
 
-    // Структурирование результатов в объект, где ключами будут даты, а значениями - статусы задач
+    let sql;
+    let params = [];
+
+    if (userRole === 'Монтажник') {
+      // Фильтруем задачи по тем, в которых участвует пользователь
+      sql = `
+        SELECT 
+          DATE(tasks.start_date) AS task_date, 
+          tasks.status 
+        FROM tasks
+        INNER JOIN task_employees ON tasks.id = task_employees.task_id 
+        WHERE task_employees.employee_id = ? AND tasks.status IN ('новая', 'в процессе')`;
+      params.push(userId);
+    } else {
+      // Запрос для всех пользователей
+      sql = `
+        SELECT 
+          DATE(start_date) AS task_date, 
+          status 
+        FROM tasks
+        WHERE status IN ('новая', 'в процессе')`;
+    }
+
+    const results = await executeQuery(sql, params);
+
     const taskDates = results.reduce((acc, result) => {
-      // Форматируем дату в строку
       const formattedDate = result.task_date.toISOString().split('T')[0];
-
       if (!acc[formattedDate]) {
         acc[formattedDate] = result.status;
       }
-
       return acc;
     }, {});
 
@@ -627,7 +736,6 @@ app.get('/task-dates', async (req, res) => {
     res.status(500).json({ error: 'Внутренняя ошибка сервера' });
   }
 });
-
 
 app.get('/inventory', async (req, res) => {
   try {
