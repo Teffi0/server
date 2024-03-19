@@ -19,8 +19,11 @@
   "dependencies": {
     "bcrypt": "^5.1.1",
     "body-parser": "^1.19.0",
+    "cron": "^3.1.6",
     "dotenv": "^16.3.1",
+    "expo-server-sdk": "^3.7.0",
     "express": "^4.17.1",
+    "firebase": "^10.9.0",
     "firebase-admin": "^11.11.0",
     "jsonwebtoken": "^9.0.2",
     "morgan": "^1.10.0",
